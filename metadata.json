@@ -1,0 +1,6 @@
+{
+  "name": "TKA ASAS SD — Simulasi & Bank Soal Kelas V",
+  "description": "Aplikasi latihan Asesmen Sumatif Akhir Semester (ASAS) Ganjil berbasis komputer mirip TKA untuk Sekolah Dasar dengan Portal Guru dan link ujian online siswa.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

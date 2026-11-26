@@ -7,9 +7,8 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import type { ParsedWordQuestion, Question, QuestionType } from '../types/exam';
+import { STANDARD_SUBJECTS, type ParsedWordQuestion, type Question, type QuestionType } from '../types/exam';
 import { QUESTION_TYPE_LABELS } from '../utils/examScoring';
-import { STANDARD_SUBJECTS } from '../data/subjects';
 
 interface TeacherWordImportModalProps {
   authToken: string;

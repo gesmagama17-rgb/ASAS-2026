@@ -1,8 +1,7 @@
 import React, { useState } from 'react';
 import { X } from 'lucide-react';
-import type { Question, QuestionOption, QuestionType } from '../types/exam';
+import { STANDARD_SUBJECTS, type Question, type QuestionOption, type QuestionType } from '../types/exam';
 import { QUESTION_TYPE_LABELS } from '../utils/examScoring';
-import { STANDARD_SUBJECTS } from '../data/subjects';
 
 interface TeacherQuestionModalProps {
   initialQuestion?: Question | null;

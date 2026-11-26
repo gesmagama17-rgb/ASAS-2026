@@ -9,6 +9,7 @@ interface TeacherQrModalProps {
   shareCode?: string;
   token?: string;
   shareUrl: string;
+  originalUrl?: string;
   originKind: OriginKind;
   onClose: () => void;
 }
@@ -19,6 +20,7 @@ export const TeacherQrModal: React.FC<TeacherQrModalProps> = ({
   shareCode,
   token,
   shareUrl,
+  originalUrl,
   originKind,
   onClose,
 }) => {
@@ -130,9 +132,15 @@ export const TeacherQrModal: React.FC<TeacherQrModalProps> = ({
             </div>
           )}
 
-          <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-700 break-all">
+          <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-800 break-all font-semibold">
             {shareUrl}
           </div>
+
+          {originalUrl && originalUrl !== shareUrl && (
+            <div className="text-[11px] text-slate-500 font-mono break-all">
+              Tujuan: {originalUrl}
+            </div>
+          )}
 
           <div className="flex items-center gap-2.5 pt-1">
             <button

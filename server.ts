@@ -8,9 +8,17 @@ import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import multer from 'multer';
 import mammoth from 'mammoth';
-import { SEED_EXAMS, SEED_QUESTIONS } from './src/data/seedQuestions';
+import { SEED_EXAMS, SEED_QUESTIONS } from './src/utils/defaultSeedBank';
 import { classifyOrigin, normalizePublicBaseUrl } from './src/utils/shareUrl';
+import {
+  normalizeCustomBackHalf,
+  parseBitlyUserResponse,
+  translateBitlyError,
+  validateLongUrlForBitly,
+} from './src/utils/bitlyClient';
 import type {
+  BitlyShortLinkRecord,
+  BitlyStatus,
   CountsByType,
   ExamPackage,
   Question,
@@ -44,6 +52,16 @@ interface TeacherSession {
   expiresAt: number;
 }
 
+interface BitlyConnectionRecord {
+  accessToken?: string;
+  login?: string;
+  name?: string;
+  defaultGroupGuid?: string;
+  domain?: string;
+  authMethod?: 'token' | 'oauth' | 'env';
+  connectedAt?: string;
+}
+
 interface DatabaseSchema {
   questions: Question[];
   exams: ExamPackage[];
@@ -56,6 +74,8 @@ interface DatabaseSchema {
     publicBaseUrl?: string;
   };
   sessions: TeacherSession[];
+  bitly?: BitlyConnectionRecord;
+  bitlyShortLinks?: Record<string, BitlyShortLinkRecord>;
 }
 
 function isPrivateOrReservedIp(ip: string): boolean {
@@ -265,6 +285,119 @@ function recalculateSubmissionsForExam(examId?: string): number {
   return updatedCount;
 }
 
+const pendingBitlyOAuthStates = new Map<
+  string,
+  { createdAt: number; redirectUri: string }
+>();
+
+function pruneBitlyOAuthStates(): void {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [key, value] of pendingBitlyOAuthStates.entries()) {
+    if (value.createdAt < cutoff) {
+      pendingBitlyOAuthStates.delete(key);
+    }
+  }
+}
+
+function getAppBaseOrigin(req?: Request): string {
+  const envAppUrl = (process.env.APP_URL || '').trim();
+  if (envAppUrl && envAppUrl !== 'MY_APP_URL' && /^https?:\/\//i.test(envAppUrl)) {
+    return envAppUrl.replace(/\/+$/, '');
+  }
+  const publicUrl = getEffectivePublicBaseUrl();
+  if (publicUrl) {
+    return publicUrl.replace(/\/+$/, '');
+  }
+  if (req) {
+    const protoHeader = req.headers['x-forwarded-proto'];
+    const proto =
+      typeof protoHeader === 'string' && protoHeader.trim()
+        ? protoHeader.split(',')[0].trim()
+        : req.protocol || 'http';
+    const host = req.get('host') || `localhost:${PORT}`;
+    return `${proto}://${host}`.replace(/\/+$/, '');
+  }
+  return `http://localhost:${PORT}`;
+}
+
+function getBitlyCallbackUrl(req?: Request): string {
+  return `${getAppBaseOrigin(req)}/api/bitly/callback`;
+}
+
+function getActiveBitlyToken(): string {
+  const saved = (db.bitly?.accessToken || '').trim();
+  if (saved) return saved;
+  return (process.env.BITLY_ACCESS_TOKEN || '').trim();
+}
+
+function isBitlyOAuthConfigured(): boolean {
+  return Boolean(
+    (process.env.BITLY_CLIENT_ID || '').trim() &&
+      (process.env.BITLY_CLIENT_SECRET || '').trim()
+  );
+}
+
+function buildPublicBitlyStatus(req?: Request): BitlyStatus {
+  const envToken = (process.env.BITLY_ACCESS_TOKEN || '').trim();
+  const savedToken = (db.bitly?.accessToken || '').trim();
+  const connected = Boolean(savedToken || envToken);
+  return {
+    connected,
+    login: db.bitly?.login,
+    name: db.bitly?.name,
+    domain: db.bitly?.domain || 'bit.ly',
+    authMethod: savedToken ? db.bitly?.authMethod || 'token' : envToken ? 'env' : undefined,
+    connectedAt: db.bitly?.connectedAt,
+    oauthConfigured: isBitlyOAuthConfigured(),
+    callbackUrl: getBitlyCallbackUrl(req),
+    envTokenActive: Boolean(envToken),
+  };
+}
+
+async function fetchBitlyAccountProfile(accessToken: string): Promise<{
+  login: string;
+  name: string;
+  defaultGroupGuid?: string;
+  domain: string;
+}> {
+  const userRes = await fetch('https://api-ssl.bitly.com/v4/user', {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(10000),
+  });
+  const userData = await userRes.json().catch(() => ({}));
+  if (!userRes.ok) {
+    throw new Error(translateBitlyError(userRes.status, userData));
+  }
+  const parsed = parseBitlyUserResponse(userData);
+  let defaultGroupGuid = parsed.defaultGroupGuid;
+  if (!defaultGroupGuid) {
+    const groupsRes = await fetch('https://api-ssl.bitly.com/v4/groups', {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (groupsRes.ok) {
+      const groupsData = (await groupsRes.json().catch(() => ({}))) as {
+        groups?: Array<{ guid?: string }>;
+      };
+      defaultGroupGuid = groupsData.groups?.[0]?.guid;
+    }
+  }
+  return {
+    login: parsed.login,
+    name: parsed.name,
+    defaultGroupGuid,
+    domain: 'bit.ly',
+  };
+}
+
 const wordUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
@@ -273,6 +406,9 @@ const wordUpload = multer({
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '5mb' }));
+  app.use('/data', (_req, res) => {
+    res.status(404).end();
+  });
 
   // --- Teacher Auth Endpoints ---
   app.get('/api/teacher/me', (req, res) => {
@@ -516,6 +652,372 @@ async function startServer() {
         message: 'Tidak dapat menghubungi URL tersebut. Periksa penulisan domain dan koneksi.',
       });
     }
+  });
+
+  // --- Teacher Bitly Integration Endpoints ---
+  app.get('/api/teacher/bitly/status', requireTeacherAuth, async (req, res) => {
+    const envToken = (process.env.BITLY_ACCESS_TOKEN || '').trim();
+    if (envToken && !db.bitly?.accessToken && !db.bitly?.login) {
+      try {
+        const profile = await fetchBitlyAccountProfile(envToken);
+        db.bitly = {
+          login: profile.login,
+          name: profile.name,
+          defaultGroupGuid: profile.defaultGroupGuid,
+          domain: profile.domain,
+          authMethod: 'env',
+          connectedAt: new Date().toISOString(),
+        };
+        saveDb(db);
+      } catch {
+        // Keep status readable even if env token check temporarily fails
+      }
+    }
+    res.json({
+      status: buildPublicBitlyStatus(req),
+      shortLinks: db.bitlyShortLinks || {},
+    });
+  });
+
+  app.post('/api/teacher/bitly/connect-token', requireTeacherAuth, async (req, res) => {
+    const rawToken = typeof req.body?.accessToken === 'string' ? req.body.accessToken.trim() : '';
+    const envToken = (process.env.BITLY_ACCESS_TOKEN || '').trim();
+    const tokenToUse = rawToken || envToken;
+
+    if (!tokenToUse) {
+      res.status(400).json({
+        error: 'Masukkan Generic Access Token dari akun Bit.ly Anda terlebih dahulu.',
+      });
+      return;
+    }
+
+    try {
+      const profile = await fetchBitlyAccountProfile(tokenToUse);
+      db.bitly = {
+        accessToken: rawToken || undefined,
+        login: profile.login,
+        name: profile.name,
+        defaultGroupGuid: profile.defaultGroupGuid,
+        domain: profile.domain,
+        authMethod: rawToken ? 'token' : 'env',
+        connectedAt: new Date().toISOString(),
+      };
+      saveDb(db);
+      res.json({
+        status: buildPublicBitlyStatus(req),
+        shortLinks: db.bitlyShortLinks || {},
+      });
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Gagal memverifikasi token Bit.ly. Periksa kembali token Anda.',
+      });
+    }
+  });
+
+  app.get('/api/teacher/bitly/oauth/url', requireTeacherAuth, (req, res) => {
+    const clientId = (process.env.BITLY_CLIENT_ID || '').trim();
+    const clientSecret = (process.env.BITLY_CLIENT_SECRET || '').trim();
+    if (!clientId || !clientSecret) {
+      res.status(400).json({
+        error:
+          'BITLY_CLIENT_ID dan BITLY_CLIENT_SECRET belum dikonfigurasi di Secrets. Anda tetap bisa menghubungkan Bit.ly secara instan menggunakan Access Token.',
+        callbackUrl: getBitlyCallbackUrl(req),
+      });
+      return;
+    }
+
+    pruneBitlyOAuthStates();
+    const state = crypto.randomBytes(24).toString('hex');
+    const redirectUri = getBitlyCallbackUrl(req);
+    pendingBitlyOAuthStates.set(state, {
+      createdAt: Date.now(),
+      redirectUri,
+    });
+
+    const params = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      state,
+    });
+    res.json({
+      url: `https://bitly.com/oauth/authorize?${params.toString()}`,
+      callbackUrl: redirectUri,
+    });
+  });
+
+  const handleBitlyOAuthCallback = async (req: Request, res: Response) => {
+    const renderPopupPage = (payload: { type: string; error?: string }, text: string) => {
+      const safePayload = JSON.stringify(payload).replace(/</g, '\\u003c');
+      const safeText = text.replace(/[<>&]/g, '');
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.send(`<!doctype html>
+<html lang="id">
+  <head><meta charset="utf-8"><title>Koneksi Bit.ly</title></head>
+  <body style="font-family:system-ui,sans-serif;padding:24px;color:#0f172a;background:#f8fafc;">
+    <p>${safeText}</p>
+    <script>
+      (function () {
+        var payload = ${safePayload};
+        if (window.opener) {
+          window.opener.postMessage(payload, '*');
+          window.close();
+        } else {
+          window.location.href = '/guru';
+        }
+      })();
+    </script>
+  </body>
+</html>`);
+    };
+
+    const oauthError = typeof req.query.error === 'string' ? req.query.error : '';
+    if (oauthError) {
+      renderPopupPage(
+        { type: 'BITLY_OAUTH_ERROR', error: 'Otorisasi Bit.ly dibatalkan oleh pengguna.' },
+        'Otorisasi Bit.ly dibatalkan. Jendela ini akan tertutup otomatis.'
+      );
+      return;
+    }
+
+    const code = typeof req.query.code === 'string' ? req.query.code : '';
+    const state = typeof req.query.state === 'string' ? req.query.state : '';
+    pruneBitlyOAuthStates();
+    const storedState = state ? pendingBitlyOAuthStates.get(state) : undefined;
+    if (state) pendingBitlyOAuthStates.delete(state);
+
+    if (!code || !storedState) {
+      renderPopupPage(
+        { type: 'BITLY_OAUTH_ERROR', error: 'Sesi otorisasi Bit.ly tidak valid atau kedaluwarsa.' },
+        'Sesi otorisasi tidak valid. Silakan ulangi dari Portal Guru.'
+      );
+      return;
+    }
+
+    const clientId = (process.env.BITLY_CLIENT_ID || '').trim();
+    const clientSecret = (process.env.BITLY_CLIENT_SECRET || '').trim();
+    if (!clientId || !clientSecret) {
+      renderPopupPage(
+        { type: 'BITLY_OAUTH_ERROR', error: 'Konfigurasi OAuth Bit.ly di server belum lengkap.' },
+        'Konfigurasi OAuth Bit.ly belum lengkap.'
+      );
+      return;
+    }
+
+    try {
+      const formBody = new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        code,
+        redirect_uri: storedState.redirectUri,
+      });
+
+      const tokenRes = await fetch('https://api-ssl.bitly.com/oauth/access_token', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json',
+        },
+        body: formBody.toString(),
+        signal: AbortSignal.timeout(10000),
+      });
+
+      const rawText = await tokenRes.text();
+      let accessToken = '';
+      try {
+        const parsedJson = JSON.parse(rawText) as { access_token?: string };
+        accessToken = (parsedJson.access_token || '').trim();
+      } catch {
+        const parsedParams = new URLSearchParams(rawText);
+        accessToken = (parsedParams.get('access_token') || '').trim();
+      }
+
+      if (!tokenRes.ok || !accessToken) {
+        renderPopupPage(
+          { type: 'BITLY_OAUTH_ERROR', error: 'Gagal menukar kode OAuth dengan token Bit.ly.' },
+          'Gagal menukar kode OAuth Bit.ly. Silakan coba lagi.'
+        );
+        return;
+      }
+
+      const profile = await fetchBitlyAccountProfile(accessToken);
+      db.bitly = {
+        accessToken,
+        login: profile.login,
+        name: profile.name,
+        defaultGroupGuid: profile.defaultGroupGuid,
+        domain: profile.domain,
+        authMethod: 'oauth',
+        connectedAt: new Date().toISOString(),
+      };
+      saveDb(db);
+
+      renderPopupPage(
+        { type: 'BITLY_OAUTH_SUCCESS' },
+        'Akun Bit.ly berhasil terhubung! Jendela ini akan tertutup otomatis.'
+      );
+    } catch {
+      renderPopupPage(
+        { type: 'BITLY_OAUTH_ERROR', error: 'Terjadi kesalahan saat menghubungkan Bit.ly.' },
+        'Terjadi kesalahan koneksi ke Bit.ly.'
+      );
+    }
+  };
+
+  app.get(['/api/bitly/callback', '/api/bitly/callback/'], handleBitlyOAuthCallback);
+
+  app.post('/api/teacher/bitly/shorten', requireTeacherAuth, async (req, res) => {
+    const token = getActiveBitlyToken();
+    if (!token) {
+      res.status(400).json({
+        error: 'Akun Bit.ly belum terhubung. Hubungkan akun Bit.ly Anda terlebih dahulu.',
+      });
+      return;
+    }
+
+    const rawTargetKey = typeof req.body?.targetKey === 'string' ? req.body.targetKey.trim() : '';
+    const targetKey = rawTargetKey.replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 64);
+    const rawLongUrl = typeof req.body?.longUrl === 'string' ? req.body.longUrl : '';
+    const rawCustomSlug = typeof req.body?.customSlug === 'string' ? req.body.customSlug : '';
+
+    if (!targetKey) {
+      res.status(400).json({ error: 'Target paket ujian tidak valid.' });
+      return;
+    }
+
+    const urlValidation = validateLongUrlForBitly(rawLongUrl);
+    if (!urlValidation.ok) {
+      res.status(400).json({ error: urlValidation.error });
+      return;
+    }
+
+    try {
+      let groupGuid = db.bitly?.defaultGroupGuid;
+      if (!groupGuid) {
+        try {
+          const profile = await fetchBitlyAccountProfile(token);
+          groupGuid = profile.defaultGroupGuid;
+          db.bitly = {
+            ...(db.bitly || {}),
+            login: profile.login,
+            name: profile.name,
+            defaultGroupGuid: profile.defaultGroupGuid,
+            domain: profile.domain,
+          };
+          saveDb(db);
+        } catch {
+          // Proceed without group_guid if Bitly allows default group inference
+        }
+      }
+
+      const domain = db.bitly?.domain || 'bit.ly';
+      const shortenBody: Record<string, string> = {
+        long_url: urlValidation.url,
+        domain,
+      };
+      if (groupGuid) {
+        shortenBody.group_guid = groupGuid;
+      }
+
+      const shortenRes = await fetch('https://api-ssl.bitly.com/v4/shorten', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(shortenBody),
+        signal: AbortSignal.timeout(10000),
+      });
+
+      const shortenData = (await shortenRes.json().catch(() => ({}))) as {
+        id?: string;
+        link?: string;
+        long_url?: string;
+      };
+
+      if (!shortenRes.ok || !shortenData.link || !shortenData.id) {
+        res.status(shortenRes.status >= 400 ? shortenRes.status : 400).json({
+          error: translateBitlyError(shortenRes.status, shortenData),
+        });
+        return;
+      }
+
+      let finalShortUrl = shortenData.link;
+      let finalBitlinkId = shortenData.id;
+      let appliedCustomSlug: string | undefined;
+      let warning = '';
+
+      const cleanSlug = normalizeCustomBackHalf(rawCustomSlug);
+      if (cleanSlug) {
+        const customBitlink = `${domain}/${cleanSlug}`;
+        const customRes = await fetch('https://api-ssl.bitly.com/v4/custom_bitlinks', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            custom_bitlink: customBitlink,
+            bitlink_id: shortenData.id,
+          }),
+          signal: AbortSignal.timeout(10000),
+        });
+        const customData = (await customRes.json().catch(() => ({}))) as {
+          custom_bitlink?: string;
+        };
+        if (customRes.ok && customData.custom_bitlink) {
+          finalShortUrl = `https://${customData.custom_bitlink}`;
+          finalBitlinkId = customData.custom_bitlink;
+          appliedCustomSlug = cleanSlug;
+        } else {
+          warning = `Link pendek ${shortenData.link} berhasil dibuat, namun nama khusus "${cleanSlug}" tidak dapat diterapkan (${translateBitlyError(customRes.status, customData)}).`;
+        }
+      }
+
+      const record: BitlyShortLinkRecord = {
+        targetKey,
+        shortUrl: finalShortUrl,
+        longUrl: urlValidation.url,
+        bitlinkId: finalBitlinkId,
+        customSlug: appliedCustomSlug,
+        createdAt: new Date().toISOString(),
+      };
+
+      if (!db.bitlyShortLinks) {
+        db.bitlyShortLinks = {};
+      }
+      db.bitlyShortLinks[targetKey] = record;
+      saveDb(db);
+
+      res.json({
+        shortLink: record,
+        shortLinks: db.bitlyShortLinks,
+        warning: warning || undefined,
+      });
+    } catch {
+      res.status(502).json({
+        error: 'Gagal menghubungi server Bit.ly. Periksa koneksi internet server dan coba lagi.',
+      });
+    }
+  });
+
+  app.delete('/api/teacher/bitly/disconnect', requireTeacherAuth, (req, res) => {
+    db.bitly = undefined;
+    saveDb(db);
+    res.json({ status: buildPublicBitlyStatus(req) });
+  });
+
+  app.delete('/api/teacher/bitly/links/:targetKey', requireTeacherAuth, (req, res) => {
+    const targetKey = req.params.targetKey;
+    if (db.bitlyShortLinks && targetKey in db.bitlyShortLinks) {
+      delete db.bitlyShortLinks[targetKey];
+      saveDb(db);
+    }
+    res.json({ shortLinks: db.bitlyShortLinks || {} });
   });
 
   // --- Teacher Questions CRUD ---

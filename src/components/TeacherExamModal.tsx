@@ -1,15 +1,15 @@
 import React, { useMemo, useState } from 'react';
 import { X } from 'lucide-react';
-import type {
-  AssessmentType,
-  CountsByType,
-  ExamPackage,
-  Question,
-  QuestionType,
-  ScoringMode,
+import {
+  STANDARD_SUBJECTS,
+  type AssessmentType,
+  type CountsByType,
+  type ExamPackage,
+  type Question,
+  type QuestionType,
+  type ScoringMode,
 } from '../types/exam';
 import { QUESTION_TYPE_LABELS } from '../utils/examScoring';
-import { STANDARD_SUBJECTS } from '../data/subjects';
 
 interface TeacherExamModalProps {
   initialExam?: ExamPackage | null;

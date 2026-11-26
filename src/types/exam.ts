@@ -15,6 +15,16 @@ export type SubjectName =
   | 'Bahasa Toraja'
   | string;
 
+export const STANDARD_SUBJECTS: string[] = [
+  'IPAS',
+  'Matematika',
+  'Bahasa Indonesia',
+  'Pendidikan Pancasila',
+  'Seni Musik',
+  'Seni Rupa',
+  'Bahasa Toraja',
+];
+
 export interface QuestionOption {
   id: string; // e.g. 'A', 'B', 'C', 'D' or 'BENAR', 'SALAH'
   text: string;
@@ -240,3 +250,25 @@ export interface ExamItemAnalysis {
     lowestScore: number | null;
   };
 }
+
+export interface BitlyShortLinkRecord {
+  targetKey: string;
+  shortUrl: string;
+  longUrl: string;
+  bitlinkId: string;
+  customSlug?: string;
+  createdAt: string;
+}
+
+export interface BitlyStatus {
+  connected: boolean;
+  login?: string;
+  name?: string;
+  domain?: string;
+  authMethod?: 'token' | 'oauth' | 'env';
+  connectedAt?: string;
+  oauthConfigured: boolean;
+  callbackUrl: string;
+  envTokenActive: boolean;
+}
+

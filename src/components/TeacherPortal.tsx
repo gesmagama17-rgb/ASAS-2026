@@ -7,13 +7,16 @@ import {
   ClipboardList,
   Copy,
   Download,
+  ExternalLink,
   FileSpreadsheet,
   Globe,
   KeyRound,
   Link2,
+  Loader2,
   LogOut,
   Plus,
   QrCode,
+  Scissors,
   Search,
   Settings,
   Share2,
@@ -24,6 +27,8 @@ import {
   Upload,
 } from 'lucide-react';
 import type {
+  BitlyShortLinkRecord,
+  BitlyStatus,
   ExamPackage,
   Question,
   QuestionType,
@@ -42,13 +47,15 @@ import {
   normalizePublicBaseUrl,
   resolveStudentShareBaseUrl,
 } from '../utils/shareUrl';
-import { STANDARD_SUBJECTS } from '../data/subjects';
+import { pickPreferredShareUrl } from '../utils/bitlyClient';
+import { STANDARD_SUBJECTS } from '../types/exam';
 import { TeacherQuestionModal } from './TeacherQuestionModal';
 import { TeacherExamModal } from './TeacherExamModal';
 import { TeacherGradingModal } from './TeacherGradingModal';
 import { TeacherWordImportModal } from './TeacherWordImportModal';
 import { TeacherItemAnalysisTab } from './TeacherItemAnalysisTab';
 import { TeacherQrModal } from './TeacherQrModal';
+import { TeacherBitlyModal } from './TeacherBitlyModal';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface TeacherPortalProps {
@@ -107,7 +114,17 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
     shareCode?: string;
     token?: string;
     shareUrl: string;
+    originalUrl?: string;
   } | null>(null);
+
+  // Bit.ly integration state
+  const [bitlyStatus, setBitlyStatus] = useState<BitlyStatus | null>(null);
+  const [bitlyLinks, setBitlyLinks] = useState<Record<string, BitlyShortLinkRecord>>({});
+  const [bitlyModalOpen, setBitlyModalOpen] = useState(false);
+  const [shorteningKey, setShorteningKey] = useState<string | null>(null);
+  const [bitlyErrorMsg, setBitlyErrorMsg] = useState('');
+  const [customSlugInputs, setCustomSlugInputs] = useState<Record<string, string>>({});
+  const [customSlugOpenFor, setCustomSlugOpenFor] = useState<string | null>(null);
 
   // Public Share URL state
   const [publicBaseUrl, setPublicBaseUrl] = useState('');
@@ -143,10 +160,11 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
     }
     setLoadingData(true);
     try {
-      const [qRes, eRes, sRes] = await Promise.all([
+      const [qRes, eRes, sRes, bRes] = await Promise.all([
         fetch('/api/teacher/questions', { headers }),
         fetch('/api/teacher/exams', { headers }),
         fetch('/api/teacher/submissions', { headers }),
+        fetch('/api/teacher/bitly/status', { headers }),
       ]);
       if (qRes.ok) {
         const qData = await qRes.json();
@@ -159,6 +177,11 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
       if (sRes.ok) {
         const sData = await sRes.json();
         setSubmissions(sData.submissions || []);
+      }
+      if (bRes.ok) {
+        const bData = await bRes.json();
+        setBitlyStatus(bData.status || null);
+        setBitlyLinks(bData.shortLinks || {});
       }
     } finally {
       setLoadingData(false);
@@ -418,8 +441,63 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
     }
   };
 
+  const handleShortenWithBitly = async (
+    targetKey: string,
+    longUrl: string,
+    customSlug?: string
+  ) => {
+    setBitlyErrorMsg('');
+    if (!bitlyStatus?.connected) {
+      setBitlyModalOpen(true);
+      return;
+    }
+
+    setShorteningKey(targetKey);
+    try {
+      const res = await fetch('/api/teacher/bitly/shorten', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        body: JSON.stringify({
+          targetKey,
+          longUrl,
+          customSlug: customSlug?.trim() || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setBitlyErrorMsg(data.error || 'Gagal memperpendek link melalui Bit.ly.');
+        return;
+      }
+      if (data.shortLinks) {
+        setBitlyLinks(data.shortLinks);
+      }
+      setCustomSlugOpenFor(null);
+      setFeedbackMsg(
+        data.warning ||
+          `Link Bit.ly berhasil dibuat: ${data.shortLink?.shortUrl || ''}`
+      );
+    } catch {
+      setBitlyErrorMsg('Gagal menghubungi server untuk membuat link Bit.ly.');
+    } finally {
+      setShorteningKey(null);
+    }
+  };
+
+  const handleRemoveBitlyLink = async (targetKey: string) => {
+    const res = await fetch(`/api/teacher/bitly/links/${encodeURIComponent(targetKey)}`, {
+      method: 'DELETE',
+      headers: authHeaders,
+    });
+    if (res.ok) {
+      const data = await res.json();
+      setBitlyLinks(data.shortLinks || {});
+    }
+  };
+
   const copyShareLink = async (exam: ExamPackage, withWhatsAppText = false) => {
-    const url = buildStudentExamUrl(shareResolution.baseUrl, exam.shareCode);
+    const fullUrl = buildStudentExamUrl(shareResolution.baseUrl, exam.shareCode);
+    const shortRecord = bitlyLinks[exam.id];
+    const url = pickPreferredShareUrl(fullUrl, shortRecord?.shortUrl);
     const content = withWhatsAppText
       ? buildWhatsAppShareMessage(
           {
@@ -443,7 +521,8 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
   };
 
   const copyGeneralStudentLink = async () => {
-    const url = buildStudentCatalogUrl(shareResolution.baseUrl);
+    const fullUrl = buildStudentCatalogUrl(shareResolution.baseUrl);
+    const url = pickPreferredShareUrl(fullUrl, bitlyLinks.catalog?.shortUrl);
     try {
       await navigator.clipboard.writeText(url);
       setCopiedId('catalog-student');
@@ -865,24 +944,48 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
                       {copiedId === 'catalog-student' ? (
                         <>
                           <Check className="w-3.5 h-3.5 text-emerald-600" />
-                          <span>Link /mulai Tersalin</span>
+                          <span>{bitlyLinks.catalog ? 'Bit.ly /mulai Tersalin' : 'Link /mulai Tersalin'}</span>
                         </>
                       ) : (
                         <>
                           <Copy className="w-3.5 h-3.5" />
-                          <span>Salin Link Daftar Ujian (/mulai)</span>
+                          <span>{bitlyLinks.catalog ? 'Salin Bit.ly /mulai' : 'Salin Link Daftar Ujian (/mulai)'}</span>
                         </>
                       )}
                     </button>
                     <button
                       type="button"
+                      disabled={shorteningKey === 'catalog'}
                       onClick={() =>
+                        void handleShortenWithBitly(
+                          'catalog',
+                          buildStudentCatalogUrl(shareResolution.baseUrl)
+                        )
+                      }
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-orange-300 bg-orange-50 hover:bg-orange-100 rounded-lg text-xs font-semibold text-orange-800 cursor-pointer disabled:opacity-60"
+                    >
+                      {shorteningKey === 'catalog' ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Scissors className="w-3.5 h-3.5" />
+                      )}
+                      <span>{bitlyLinks.catalog ? 'Perbarui Bit.ly /mulai' : 'Perpendek /mulai (Bit.ly)'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const fullCatalogUrl = buildStudentCatalogUrl(shareResolution.baseUrl);
+                        const preferred = pickPreferredShareUrl(
+                          fullCatalogUrl,
+                          bitlyLinks.catalog?.shortUrl
+                        );
                         setQrModalTarget({
                           title: 'Daftar Paket Ujian Siswa (Semua Mapel)',
                           subtitle: `${schoolName} · Tanpa Portal Guru`,
-                          shareUrl: buildStudentCatalogUrl(shareResolution.baseUrl),
-                        })
-                      }
+                          shareUrl: preferred,
+                          originalUrl: fullCatalogUrl,
+                        });
+                      }}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-slate-300 bg-white hover:bg-slate-50 rounded-lg text-xs font-semibold text-slate-800 cursor-pointer"
                     >
                       <QrCode className="w-3.5 h-3.5" />
@@ -909,6 +1012,32 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
                     )}
                   </div>
                 </div>
+
+                {bitlyLinks.catalog && (
+                  <div className="mt-3 pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="px-2 py-0.5 bg-orange-100 text-orange-800 font-bold rounded text-[11px]">
+                        Bit.ly /mulai
+                      </span>
+                      <a
+                        href={bitlyLinks.catalog.shortUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="font-mono font-semibold text-sky-800 hover:underline inline-flex items-center gap-1"
+                      >
+                        <span>{bitlyLinks.catalog.shortUrl}</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleRemoveBitlyLink('catalog')}
+                      className="text-[11px] text-slate-500 hover:text-red-600 cursor-pointer"
+                    >
+                      Hapus tautan pendek
+                    </button>
+                  </div>
+                )}
 
                 {(shareResolution.originKind === 'ai_studio_dev' || editingPublicUrl) && (
                   <form
@@ -983,6 +1112,69 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
                 );
               })()}
 
+              {/* Bit.ly Account Connection Card */}
+              <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-start gap-3 min-w-0">
+                    <div
+                      className={`w-9 h-9 rounded-lg border flex items-center justify-center shrink-0 ${
+                        bitlyStatus?.connected
+                          ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                          : 'bg-orange-50 border-orange-200 text-orange-700'
+                      }`}
+                    >
+                      <Scissors className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h2 className="text-sm font-bold text-slate-900">
+                          {bitlyStatus?.connected
+                            ? `Terhubung ke Bit.ly (@${bitlyStatus.login || 'aktif'})`
+                            : 'Hubungkan Akun Bit.ly Anda'}
+                        </h2>
+                        {bitlyStatus?.connected && (
+                          <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 text-[11px] font-bold rounded">
+                            Aktif
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-slate-600 mt-0.5">
+                        {bitlyStatus?.connected
+                          ? 'Klik "Perpendek via Bit.ly" pada paket ujian mana saja untuk membuat tautan singkat bit.ly yang otomatis masuk ke pesan WhatsApp dan QR Code.'
+                          : 'Perpendek link ujian murid menjadi bit.ly/... langsung dari aplikasi ini agar mudah diketik atau dikirim lewat WhatsApp.'}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setBitlyModalOpen(true)}
+                    className={`px-3.5 py-2 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
+                      bitlyStatus?.connected
+                        ? 'border border-slate-300 bg-white hover:bg-slate-50 text-slate-800'
+                        : 'bg-orange-600 hover:bg-orange-700 text-white'
+                    }`}
+                  >
+                    {bitlyStatus?.connected ? 'Kelola Akun Bit.ly' : 'Hubungkan Akun Bit.ly'}
+                  </button>
+                </div>
+
+                {bitlyErrorMsg && (
+                  <div
+                    role="alert"
+                    className="p-2.5 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800 flex items-center justify-between gap-2"
+                  >
+                    <span>{bitlyErrorMsg}</span>
+                    <button
+                      type="button"
+                      onClick={() => setBitlyErrorMsg('')}
+                      className="text-xs font-semibold underline shrink-0 cursor-pointer"
+                    >
+                      Tutup
+                    </button>
+                  </div>
+                )}
+              </div>
+
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <h2 className="text-base font-bold text-slate-900">
@@ -1020,6 +1212,9 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
                       shareResolution.baseUrl,
                       exam.shareCode
                     );
+                    const bitlyRecord = bitlyLinks[exam.id];
+                    const activeShareUrl = pickPreferredShareUrl(shareUrl, bitlyRecord?.shortUrl);
+                    const bitlyOutdated = Boolean(bitlyRecord && bitlyRecord.longUrl !== shareUrl);
                     const breakdown = (
                       Object.entries(exam.countsByType) as Array<[QuestionType, number]>
                     )
@@ -1095,15 +1290,74 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
                         </div>
 
                         {/* Share Link Bar */}
-                        <div className="pt-3 border-t border-slate-100 space-y-2">
+                        <div className="pt-3 border-t border-slate-100 space-y-2.5">
                           <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
-                            <div className="flex items-center gap-2 min-w-0">
-                              <Link2 className="w-4 h-4 text-slate-400 shrink-0" />
-                              <code className="text-xs font-mono text-slate-700 truncate">
-                                {shareUrl}
-                              </code>
+                            <div className="min-w-0 space-y-1">
+                              {bitlyRecord ? (
+                                <>
+                                  <div className="flex flex-wrap items-center gap-2 min-w-0">
+                                    <span className="px-2 py-0.5 bg-orange-100 text-orange-800 text-[11px] font-bold rounded shrink-0">
+                                      Bit.ly
+                                    </span>
+                                    <a
+                                      href={bitlyRecord.shortUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-sm font-mono font-bold text-sky-800 hover:underline inline-flex items-center gap-1 truncate"
+                                    >
+                                      <span>{bitlyRecord.shortUrl}</span>
+                                      <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                                    </a>
+                                    {bitlyOutdated && (
+                                      <span className="text-[11px] font-semibold text-amber-700">
+                                        (Domain berubah — perbarui Bit.ly)
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-1.5 text-[11px] font-mono text-slate-500 truncate">
+                                    <Link2 className="w-3 h-3 shrink-0" />
+                                    <span className="truncate">{shareUrl}</span>
+                                  </div>
+                                </>
+                              ) : (
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <Link2 className="w-4 h-4 text-slate-400 shrink-0" />
+                                  <code className="text-xs font-mono text-slate-700 truncate">
+                                    {shareUrl}
+                                  </code>
+                                </div>
+                              )}
                             </div>
+
                             <div className="flex flex-wrap items-center gap-2 shrink-0">
+                              <button
+                                type="button"
+                                disabled={shorteningKey === exam.id}
+                                onClick={() => void handleShortenWithBitly(exam.id, shareUrl)}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-orange-50 border border-orange-300 rounded-lg text-xs font-semibold text-orange-800 hover:bg-orange-100 cursor-pointer disabled:opacity-60"
+                              >
+                                {shorteningKey === exam.id ? (
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : (
+                                  <Scissors className="w-3.5 h-3.5" />
+                                )}
+                                <span>
+                                  {bitlyRecord ? 'Buat Ulang Bit.ly' : 'Perpendek via Bit.ly'}
+                                </span>
+                              </button>
+                              {bitlyStatus?.connected && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setCustomSlugOpenFor((prev) =>
+                                      prev === exam.id ? null : exam.id
+                                    )
+                                  }
+                                  className="px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
+                                >
+                                  Custom Link
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 onClick={() => void copyShareLink(exam, false)}
@@ -1112,12 +1366,12 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
                                 {copiedId === exam.id ? (
                                   <>
                                     <Check className="w-3.5 h-3.5 text-emerald-600" />
-                                    <span>Link Tersalin</span>
+                                    <span>{bitlyRecord ? 'Bit.ly Tersalin' : 'Link Tersalin'}</span>
                                   </>
                                 ) : (
                                   <>
                                     <Copy className="w-3.5 h-3.5" />
-                                    <span>Salin Link Murid</span>
+                                    <span>{bitlyRecord ? 'Salin Bit.ly' : 'Salin Link Murid'}</span>
                                   </>
                                 )}
                               </button>
@@ -1146,7 +1400,8 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
                                     subtitle: `${exam.subject} · ${exam.questionIds.length} Soal · ${exam.durationMinutes} Menit`,
                                     shareCode: exam.shareCode,
                                     token: exam.token,
-                                    shareUrl,
+                                    shareUrl: activeShareUrl,
+                                    originalUrl: shareUrl,
                                   })
                                 }
                                 className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-semibold text-slate-800 hover:bg-slate-100 cursor-pointer"
@@ -1156,6 +1411,58 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
                               </button>
                             </div>
                           </div>
+
+                          {customSlugOpenFor === exam.id && (
+                            <form
+                              onSubmit={(e) => {
+                                e.preventDefault();
+                                void handleShortenWithBitly(
+                                  exam.id,
+                                  shareUrl,
+                                  customSlugInputs[exam.id] || ''
+                                );
+                              }}
+                              className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex flex-col sm:flex-row sm:items-center gap-2"
+                            >
+                              <label
+                                htmlFor={`slug-${exam.id}`}
+                                className="text-xs font-semibold text-slate-700 whitespace-nowrap"
+                              >
+                                bit.ly/
+                              </label>
+                              <input
+                                id={`slug-${exam.id}`}
+                                type="text"
+                                value={
+                                  customSlugInputs[exam.id] ??
+                                  exam.shareCode.toLowerCase()
+                                }
+                                onChange={(e) =>
+                                  setCustomSlugInputs((prev) => ({
+                                    ...prev,
+                                    [exam.id]: e.target.value,
+                                  }))
+                                }
+                                placeholder="misal: asas-ipas-kelas5"
+                                className="flex-1 px-2.5 py-1.5 bg-white border border-slate-300 rounded-md text-xs font-mono"
+                              />
+                              <button
+                                type="submit"
+                                disabled={shorteningKey === exam.id}
+                                className="px-3 py-1.5 bg-sky-700 hover:bg-sky-800 text-white text-xs font-semibold rounded-md cursor-pointer disabled:opacity-60"
+                              >
+                                {shorteningKey === exam.id ? 'Membuat...' : 'Terapkan Nama'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setCustomSlugOpenFor(null)}
+                                className="px-2.5 py-1.5 border border-slate-300 bg-white text-xs font-semibold text-slate-600 rounded-md cursor-pointer"
+                              >
+                                Batal
+                              </button>
+                            </form>
+                          )}
+
                           {shareResolution.originKind === 'ai_studio_dev' && (
                             <p className="text-[11px] text-amber-800">
                               Catatan: Domain preview <code className="font-mono">ais-dev-...</code> meminta login Google AI Studio. Atur URL hasil Deploy di kotak atas agar link ini langsung terbuka untuk murid.
@@ -1518,97 +1825,119 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
 
           {/* TAB 5: SETTINGS */}
           {activeTab === 'settings' && (
-            <div className="max-w-xl bg-white border border-slate-200 rounded-xl p-6">
-              <h2 className="text-base font-bold text-slate-900">Pengaturan Identitas & Keamanan Portal</h2>
-              <p className="mt-1 text-xs text-slate-500">
-                Ubah nama sekolah, nama guru, atau kata sandi masuk Portal Guru.
-              </p>
-
-              {settingsStatus && (
-                <div className="mt-4 p-3 bg-slate-50 border border-slate-200 rounded-lg text-sm text-slate-800">
-                  {settingsStatus}
-                </div>
-              )}
-
-              <form onSubmit={handleSaveSettings} className="mt-5 space-y-4">
-                <div>
-                  <label htmlFor="set-teacher-name" className="block text-xs font-semibold text-slate-700 mb-1">
-                    Nama Guru
-                  </label>
-                  <input
-                    id="set-teacher-name"
-                    type="text"
-                    value={settingsName}
-                    onChange={(e) => setSettingsName(e.target.value)}
-                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
-                  />
-                </div>
-                <div>
-                  <label htmlFor="set-school-name" className="block text-xs font-semibold text-slate-700 mb-1">
-                    Nama Sekolah
-                  </label>
-                  <input
-                    id="set-school-name"
-                    type="text"
-                    value={settingsSchool}
-                    onChange={(e) => setSettingsSchool(e.target.value)}
-                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
-                  />
-                </div>
-                <div>
-                  <label htmlFor="set-public-url" className="block text-xs font-semibold text-slate-700 mb-1">
-                    URL Publik Aplikasi untuk Link Murid (Opsional)
-                  </label>
-                  <input
-                    id="set-public-url"
-                    type="text"
-                    inputMode="url"
-                    value={settingsPublicUrl}
-                    onChange={(e) => setSettingsPublicUrl(e.target.value)}
-                    placeholder="Contoh: https://tka-sd-xxxx.asia-southeast1.run.app"
-                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono"
-                  />
-                  <p className="mt-1 text-xs text-slate-500">
-                    Isi dengan URL hasil Deploy agar semua link ujian yang disalin bisa langsung dibuka murid tanpa login Google AI Studio.
-                  </p>
-                </div>
-                <div className="pt-3 border-t border-slate-200 space-y-3">
-                  <div className="text-xs font-bold text-slate-800">
-                    Ganti Kata Sandi Portal Guru (Opsional)
-                  </div>
+            <div className="space-y-6 max-w-xl">
+              <div className="bg-white border border-slate-200 rounded-xl p-6">
+                <div className="flex items-start justify-between gap-3">
                   <div>
-                    <label htmlFor="set-old-pass" className="block text-xs font-semibold text-slate-700 mb-1">
-                      Kata Sandi Lama
+                    <h2 className="text-base font-bold text-slate-900">Integrasi Akun Bit.ly</h2>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {bitlyStatus?.connected
+                        ? `Terhubung dengan akun @${bitlyStatus.login || 'bitly-user'} (${bitlyStatus.domain || 'bit.ly'}).`
+                        : 'Belum terhubung ke akun Bit.ly. Hubungkan untuk memperpendek tautan ujian siswa.'}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setBitlyModalOpen(true)}
+                    className="px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold rounded-lg shrink-0 cursor-pointer"
+                  >
+                    {bitlyStatus?.connected ? 'Kelola Bit.ly' : 'Hubungkan Bit.ly'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="bg-white border border-slate-200 rounded-xl p-6">
+                <h2 className="text-base font-bold text-slate-900">Pengaturan Identitas & Keamanan Portal</h2>
+                <p className="mt-1 text-xs text-slate-500">
+                  Ubah nama sekolah, nama guru, atau kata sandi masuk Portal Guru.
+                </p>
+
+                {settingsStatus && (
+                  <div className="mt-4 p-3 bg-slate-50 border border-slate-200 rounded-lg text-sm text-slate-800">
+                    {settingsStatus}
+                  </div>
+                )}
+
+                <form onSubmit={handleSaveSettings} className="mt-5 space-y-4">
+                  <div>
+                    <label htmlFor="set-teacher-name" className="block text-xs font-semibold text-slate-700 mb-1">
+                      Nama Guru
                     </label>
                     <input
-                      id="set-old-pass"
-                      type="password"
-                      value={currentPassword}
-                      onChange={(e) => setCurrentPassword(e.target.value)}
+                      id="set-teacher-name"
+                      type="text"
+                      value={settingsName}
+                      onChange={(e) => setSettingsName(e.target.value)}
                       className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
                     />
                   </div>
                   <div>
-                    <label htmlFor="set-new-pass" className="block text-xs font-semibold text-slate-700 mb-1">
-                      Kata Sandi Baru
+                    <label htmlFor="set-school-name" className="block text-xs font-semibold text-slate-700 mb-1">
+                      Nama Sekolah
                     </label>
                     <input
-                      id="set-new-pass"
-                      type="password"
-                      value={newPassword}
-                      onChange={(e) => setNewPassword(e.target.value)}
+                      id="set-school-name"
+                      type="text"
+                      value={settingsSchool}
+                      onChange={(e) => setSettingsSchool(e.target.value)}
                       className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
                     />
                   </div>
-                </div>
+                  <div>
+                    <label htmlFor="set-public-url" className="block text-xs font-semibold text-slate-700 mb-1">
+                      URL Publik Aplikasi untuk Link Murid (Opsional)
+                    </label>
+                    <input
+                      id="set-public-url"
+                      type="text"
+                      inputMode="url"
+                      value={settingsPublicUrl}
+                      onChange={(e) => setSettingsPublicUrl(e.target.value)}
+                      placeholder="Contoh: https://tka-sd-xxxx.asia-southeast1.run.app"
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono"
+                    />
+                    <p className="mt-1 text-xs text-slate-500">
+                      Isi dengan URL hasil Deploy agar semua link ujian yang disalin bisa langsung dibuka murid tanpa login Google AI Studio.
+                    </p>
+                  </div>
+                  <div className="pt-3 border-t border-slate-200 space-y-3">
+                    <div className="text-xs font-bold text-slate-800">
+                      Ganti Kata Sandi Portal Guru (Opsional)
+                    </div>
+                    <div>
+                      <label htmlFor="set-old-pass" className="block text-xs font-semibold text-slate-700 mb-1">
+                        Kata Sandi Lama
+                      </label>
+                      <input
+                        id="set-old-pass"
+                        type="password"
+                        value={currentPassword}
+                        onChange={(e) => setCurrentPassword(e.target.value)}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="set-new-pass" className="block text-xs font-semibold text-slate-700 mb-1">
+                        Kata Sandi Baru
+                      </label>
+                      <input
+                        id="set-new-pass"
+                        type="password"
+                        value={newPassword}
+                        onChange={(e) => setNewPassword(e.target.value)}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                      />
+                    </div>
+                  </div>
 
-                <button
-                  type="submit"
-                  className="px-5 py-2.5 bg-sky-700 hover:bg-sky-800 text-white text-sm font-semibold rounded-lg cursor-pointer"
-                >
-                  Simpan Pengaturan
-                </button>
-              </form>
+                  <button
+                    type="submit"
+                    className="px-5 py-2.5 bg-sky-700 hover:bg-sky-800 text-white text-sm font-semibold rounded-lg cursor-pointer"
+                  >
+                    Simpan Pengaturan
+                  </button>
+                </form>
+              </div>
             </div>
           )}
         </main>
@@ -1672,8 +2001,18 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({ onBackToHome }) =>
           shareCode={qrModalTarget.shareCode}
           token={qrModalTarget.token}
           shareUrl={qrModalTarget.shareUrl}
+          originalUrl={qrModalTarget.originalUrl}
           originKind={shareResolution.originKind}
           onClose={() => setQrModalTarget(null)}
+        />
+      )}
+
+      {bitlyModalOpen && (
+        <TeacherBitlyModal
+          bitlyStatus={bitlyStatus}
+          authHeaders={authHeaders}
+          onStatusUpdated={(nextStatus) => setBitlyStatus(nextStatus)}
+          onClose={() => setBitlyModalOpen(false)}
         />
       )}
     </div>
